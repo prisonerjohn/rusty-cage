@@ -11,12 +11,11 @@ use winit::{
 use wgpu::util::DeviceExt;
 
 mod texture;
-//mod model;
 mod mesh;
 mod camera;
 mod gui;
 
-//use model::Vertex;
+use camera::Camera;
 use mesh::Vertex;
 use gui::{Gui, GuiEvent};
 
@@ -88,27 +87,6 @@ impl Instance {
             model: model.into(),
             normal: cgmath::Matrix3::from(self.rotation).into(), 
         }
-    }
-}
-
-#[repr(C)]
-#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct CameraUniform {
-    view_pos: [f32; 4],
-    view_proj: [[f32; 4]; 4],
-}
-
-impl CameraUniform {
-    fn new() -> Self {
-        Self {
-            view_pos: [0.0; 4],
-            view_proj: cgmath::Matrix4::identity().into(),
-        }
-    }
-
-    fn update_view_proj(&mut self, camera: &camera::Camera, projection: &camera::Projection) {
-        self.view_pos = camera.position.to_homogeneous().into();
-        self.view_proj = (projection.calc_matrix() * camera.calc_matrix()).into();
     }
 }
 
@@ -500,12 +478,7 @@ struct State {
     size: winit::dpi::PhysicalSize<u32>,
     depth_texture: texture::Texture,
     depth_bind_group: wgpu::BindGroup,
-    camera: camera::Camera,
-    projection: camera::Projection,
-    camera_controller: camera::CameraController,
-    camera_uniform: CameraUniform,
-    camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
+    camera: Camera,
     // light_uniform: LightUniform,
     // light_buffer: wgpu::Buffer,
     // light_bind_group: wgpu::BindGroup,
@@ -622,44 +595,12 @@ impl State {
             }
         );  
 
-        let camera = camera::Camera::new((0.0, 5.0, 10.0), cgmath::Deg(-90.0), cgmath::Deg(-20.0));
-        let projection = camera::Projection::new(config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0);
-        let camera_controller = camera::CameraController::new(4.0, 0.4);
-
-        let mut camera_uniform = CameraUniform::new();
-        camera_uniform.update_view_proj(&camera, &projection);
-
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"),
-            contents: bytemuck::cast_slice(&[camera_uniform]),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Camera Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-        });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Camera Bind Group"),
-            layout: &camera_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: camera_buffer.as_entire_binding(),
-                },
-            ],
-        });
+        let camera = Camera::new(
+            &device,
+            (0.0, 5.0, 10.0),
+            cgmath::Deg(-90.0), cgmath::Deg(-20.0),
+            config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0,
+        );
 
         // let light_uniform = LightUniform {
         //     position: [2.0, 2.0, 2.0],
@@ -698,7 +639,7 @@ impl State {
         let wire_pass = WirePass::new(
             &device, 
             &config,
-            &camera_bind_group_layout
+            &camera.layout
         );
 
         let displace_pass = DisplacePass::new(
@@ -735,11 +676,6 @@ impl State {
             depth_texture,
             depth_bind_group,
             camera,
-            projection,
-            camera_controller,
-            camera_uniform,
-            camera_buffer,
-            camera_bind_group,
             // light_uniform,
             // light_buffer,
             // light_bind_group,
@@ -747,8 +683,6 @@ impl State {
             wire_pass,
             displace_pass,
             mouse_pressed: false,
-            //displace_render_pipeline,
-            //quad_mesh,
         }
     }
 
@@ -759,7 +693,7 @@ impl State {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
 
-            self.projection.resize(new_size.width, new_size.height);
+            self.camera.projection.resize(new_size.width, new_size.height);
 
             self.depth_texture = texture::Texture::create_depth_texture(&self.device, &self.config, "depth_texture");
         
@@ -793,14 +727,14 @@ impl State {
                     //     self.wire_pass.remesh(&self.device, 1.0, 3);
                     //     true
                     // }
-                    _ => self.camera_controller.process_keyboard(*key, *state),
+                    _ => self.camera.controller.process_keyboard(*key, *state),
                 }
             },
             DeviceEvent::MouseWheel {
                 delta,
                 ..
             } => {
-                self.camera_controller.process_scroll(delta);
+                self.camera.controller.process_scroll(delta);
                 true
             }
             DeviceEvent::Button {
@@ -814,7 +748,7 @@ impl State {
                 delta
             } => {
                 if self.mouse_pressed {
-                    self.camera_controller.process_mouse(delta.0, delta.1);
+                    self.camera.controller.process_mouse(delta.0, delta.1);
                 }
                 true
             }
@@ -830,10 +764,7 @@ impl State {
     }
 
     fn update(&mut self, dt: std::time::Duration) {
-        // Update the camera.
-        self.camera_controller.update_camera(&mut self.camera, dt);
-        self.camera_uniform.update_view_proj(&self.camera, &self.projection);
-        self.queue.write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[self.camera_uniform]));
+        self.camera.update(dt, &mut self.queue);
     
         // Update the light.
         // let prev_pos: cgmath::Vector3<_> = self.light_uniform.position.into();
@@ -849,18 +780,12 @@ impl State {
         output_view: &wgpu::TextureView,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<(), wgpu::SurfaceError> {
-        // let output = self.surface.get_current_texture().unwrap();
-        // let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        // let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        //     label: Some("Render Encoder"),
-        // });
-
         self.wire_pass.render(
             //&view,
             &self.displace_pass.texture.view,
             encoder,
             &self.depth_texture,
-            &self.camera_bind_group,
+            &self.camera.bind_group,
         );
 
         self.displace_pass.render(
@@ -877,50 +802,6 @@ impl State {
             //     &self.light_bind_group,
             // );
         }
-
-        // submit will accept anything that implements IntoIter
-        // self.queue.submit(std::iter::once(encoder.finish()));
-
-
-        // let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-        //     label: Some("Displace Encoder"),
-        // });
-        // {
-        //     let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-        //         label: Some("Displace Pass"),
-        //         color_attachments: &[
-        //             wgpu::RenderPassColorAttachment {
-        //                 view: &view,
-        //                 resolve_target: None,
-        //                 ops: wgpu::Operations {
-        //                     load: wgpu::LoadOp::Clear(self.clear_color),
-        //                     store: true,
-        //                 },
-        //             }
-        //         ],
-        //         depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-        //             view: &self.depth_texture.view,
-        //             depth_ops: Some(wgpu::Operations {
-        //                 load: wgpu::LoadOp::Clear(1.0),
-        //                 store: true,
-        //             }),
-        //             stencil_ops: None,
-        //         }),
-        //     });
-
-        //     use crate::mesh::DrawMesh;
-        //     render_pass.set_pipeline(&self.displace_render_pipeline);
-        //     render_pass.draw_mesh(
-        //         &self.quad_mesh,
-        //         Some(vec![&self.depth_bind_group]),
-        //         // &self.light_bind_group,
-        //     );
-        // }
-
-        // submit will accept anything that implements IntoIter
-        // self.queue.submit(std::iter::once(encoder.finish()));
-
-        // output.present();
 
         Ok(())
     }
