@@ -1,7 +1,7 @@
 use cgmath::prelude::*;
 use egui::{
     Slider,
-    Ui,
+    Ui, Checkbox,
 };
 use winit::{
     event::*,
@@ -18,8 +18,6 @@ mod gui;
 use camera::Camera;
 use mesh::Vertex;
 use gui::{Gui, GuiEvent};
-
-const ROTATION_SPEED: f32 = 2.0 * std::f32::consts::PI / 60.0;
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -99,6 +97,16 @@ fn quat_mul(q: cgmath::Quaternion<f32>, r: cgmath::Quaternion<f32>) -> cgmath::Q
     cgmath::Quaternion::new(w, xi, yj, zk)
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct WireUniform {
+    smoothing: f32,
+    thickness: f32,
+    invert_edges: u32,
+    // Uniforms require 16 byte spacing, so we need padding here
+    _padding: u32,
+}
+
 // #[repr(C)]
 // #[derive(Debug, Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 // struct LightUniform {
@@ -175,6 +183,10 @@ struct WirePass {
     mesh: mesh::Mesh,
     instances: Vec<Instance>,
     instance_buffer: wgpu::Buffer,
+    uniform: WireUniform,
+    uniform_buffer: wgpu::Buffer,
+    uniform_bind_group: wgpu::BindGroup,
+    rotation_speed: f32,
     render_pipeline: wgpu::RenderPipeline,
 }
 
@@ -196,27 +208,34 @@ impl WirePass {
             false,
         ).unwrap();
 
-        const NUM_INSTANCES_PER_DIM: u32 = 10;
-        const SPACE_BETWEEN: f32 = 3.0;
-        let instances = (0..NUM_INSTANCES_PER_DIM).flat_map(|z| {
-            (0..NUM_INSTANCES_PER_DIM).map(move |x| {
-                let x = SPACE_BETWEEN * (x as f32 - NUM_INSTANCES_PER_DIM as f32 / 2.0);
-                let z = SPACE_BETWEEN * (z as f32 - NUM_INSTANCES_PER_DIM as f32 / 2.0);
+        // const NUM_INSTANCES_PER_DIM: u32 = 10;
+        // const SPACE_BETWEEN: f32 = 3.0;
+        // let instances = (0..NUM_INSTANCES_PER_DIM).flat_map(|z| {
+        //     (0..NUM_INSTANCES_PER_DIM).map(move |x| {
+        //         let x = SPACE_BETWEEN * (x as f32 - NUM_INSTANCES_PER_DIM as f32 / 2.0);
+        //         let z = SPACE_BETWEEN * (z as f32 - NUM_INSTANCES_PER_DIM as f32 / 2.0);
 
-                let position = cgmath::Vector3 { x, y: 0.0, z };
+        //         let position = cgmath::Vector3 { x, y: 0.0, z };
 
-                let rotation = if position.is_zero() {
-                    cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
-                } else {
-                    cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(45.0))
-                };
+        //         let rotation = if position.is_zero() {
+        //             cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0))
+        //         } else {
+        //             cgmath::Quaternion::from_axis_angle(position.normalize(), cgmath::Deg(45.0))
+        //         };
 
-                Instance {
-                    position,
-                    rotation,
-                }
-            })
-        }).collect::<Vec<_>>();
+        //         Instance {
+        //             position,
+        //             rotation,
+        //         }
+        //     })
+        // }).collect::<Vec<_>>();
+
+        let instances = vec![
+            Instance {
+                position: cgmath::Vector3::zero(),
+                rotation: cgmath::Quaternion::from_axis_angle(cgmath::Vector3::unit_z(), cgmath::Deg(0.0)),
+            }
+        ];
 
         let instance_buffer = {
             let instance_data = instances.iter()
@@ -230,13 +249,50 @@ impl WirePass {
             })
         };
 
+        let uniform_data = WireUniform {
+            smoothing: 0.5,
+            thickness: 8.0,
+            invert_edges: 0,
+            _padding: 0,
+        };
+
+        let uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Wire VB"),
+            contents: bytemuck::cast_slice(&[uniform_data]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        let uniform_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label:None,
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            }],
+        });
+
+        let rotation_speed = 0.01;
+
         let render_pipeline = {
             let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Wire Pipeline Layout"),
                 bind_group_layouts: &[
                     //&texture_bind_group_layout,
                     &camera_bind_group_layout,
-                    // &light_bind_group_layout,
+                    &uniform_bind_group_layout,
                 ],
                 push_constant_ranges: &[],
             });
@@ -263,6 +319,10 @@ impl WirePass {
             mesh,
             instances,
             instance_buffer,
+            uniform: uniform_data,
+            uniform_buffer,
+            uniform_bind_group,
+            rotation_speed,
             render_pipeline,
         }
     }
@@ -283,7 +343,7 @@ impl WirePass {
     fn update(&mut self, _dt: std::time::Duration, queue: &mut wgpu::Queue) {
         // Update the instances.
         for instance in &mut self.instances {
-            let amount = cgmath::Quaternion::from_angle_y(cgmath::Rad(ROTATION_SPEED));
+            let amount = cgmath::Quaternion::from_angle_y(cgmath::Rad(self.rotation_speed));
             let current = instance.rotation;
             instance.rotation = quat_mul(amount, current);
         }
@@ -291,6 +351,9 @@ impl WirePass {
             .map(Instance::to_raw)
             .collect::<Vec<_>>();
         queue.write_buffer(&self.instance_buffer, 0, bytemuck::cast_slice(&instance_data));
+
+        // Update the uniforms.
+        queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[self.uniform]));
     }
 
     fn render(
@@ -329,8 +392,10 @@ impl WirePass {
         render_pass.draw_mesh_instanced(
             &self.mesh,
             0..self.instances.len() as u32,
-            Some(vec![&camera_bind_group]),
-            // &self.light_bind_group,
+            Some(vec![
+                &camera_bind_group,
+                &self.uniform_bind_group,
+            ]),
         );
     }
 }
@@ -494,7 +559,7 @@ impl epi::App for State {
     }
 
     fn update(&mut self, ctx: &egui::CtxRef, _frame: &epi::Frame) {
-        egui::Window::new("easy")
+        egui::Window::new(self.name())
             //.frame(egui::containers::Frame::dark_canvas(&ctx.style()))
             .show(ctx, |ui| self.ui(ui));
     }
@@ -597,8 +662,8 @@ impl State {
 
         let camera = Camera::new(
             &device,
-            (0.0, 5.0, 10.0),
-            cgmath::Deg(-90.0), cgmath::Deg(-20.0),
+            (0.0, 0.0, 5.0),
+            cgmath::Deg(-90.0), cgmath::Deg(0.0),
             config.width, config.height, cgmath::Deg(45.0), 0.1, 100.0,
         );
 
@@ -757,10 +822,19 @@ impl State {
     }
 
     fn ui(&mut self, ui: &mut Ui) {
-        ui.label(format!("Mouse pressed?: {}", self.mouse_pressed));
         if ui.add(Slider::new(&mut self.wire_pass.radius, 0.0..=5.0).text("radius")).changed() {
             self.wire_pass.remesh(&self.device);
         }
+        if ui.add(Slider::new(&mut self.wire_pass.iterations, 0..=4).text("iterations")).changed() {
+            self.wire_pass.remesh(&self.device);
+        }
+        ui.add(Slider::new(&mut self.wire_pass.uniform.smoothing, 0.0..=5.0).text("smoothing"));
+        ui.add(Slider::new(&mut self.wire_pass.uniform.thickness, 0.0..=64.0).text("thickness"));
+        let mut invert_flag = if self.wire_pass.uniform.invert_edges > 0 { true } else { false };
+        if ui.add(Checkbox::new(&mut invert_flag, "invert edges")).changed() {
+            self.wire_pass.uniform.invert_edges = if invert_flag { 1 } else { 0 };
+        }
+        ui.add(Slider::new(&mut self.wire_pass.rotation_speed, (-1.0 * std::f32::consts::PI / 60.0)..=(std::f32::consts::PI / 60.0)).text("speed"));
     }
 
     fn update(&mut self, dt: std::time::Duration) {

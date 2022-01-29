@@ -4,9 +4,17 @@ struct Camera {
     view_pos: vec4<f32>;
     view_proj: mat4x4<f32>;
 };
-// [[group(1), binding(0)]]
 [[group(0), binding(0)]]
 var<uniform> camera: Camera;
+
+struct Wire {
+    smoothing: f32;
+    thickness: f32;
+    invert_edges: u32;
+    //_padding: u32;
+};
+[[group(1), binding(0)]]
+var<uniform> wire: Wire;
 
 // [[block]]
 // struct Light {
@@ -28,7 +36,7 @@ struct VertexInput {
 struct VertexOutput {
     [[builtin(position)]] clip_position: vec4<f32>;
     [[location(0)]] tex_coords: vec2<f32>;
-    [[location(1)]] obj_normal: vec3<f32>;
+    [[location(1)]] world_position: vec3<f32>;
     [[location(2)]] bary_coords: vec2<f32>;
     // [[location(1)]] tangent_position: vec3<f32>;
     // [[location(2)]] tangent_light_position: vec3<f32>;
@@ -77,23 +85,19 @@ fn vs_main(
     var out: VertexOutput;
     out.clip_position = camera.view_proj * world_position;
     out.tex_coords = model.tex_coords;
-    //out.obj_normal = model.bitangent;
+    out.world_position = world_position.xyz;
+
     // out.tangent_position = tangent_matrix * world_position.xyz;
     // out.tangent_view_position = tangent_matrix * camera.view_pos.xyz;
     // out.tangent_light_position = tangent_matrix * light.position;
 
     if (i32(model.vertex_index) % 3 == 0) {
-        out.obj_normal = vec3<f32>(1.0, 0.0, 0.0);
         out.bary_coords = vec2<f32>(1.0, 0.0);
     } else if (i32(model.vertex_index) % 3 == 1) {
-        out.obj_normal = vec3<f32>(0.0, 1.0, 0.0);
         out.bary_coords = vec2<f32>(0.0, 1.0);
     } else {
-        out.obj_normal = vec3<f32>(0.0, 0.0, 1.0);
         out.bary_coords = vec2<f32>(0.0, 0.0);
     }
-
-    out.obj_normal = model.bitangent;
 
     return out;
 }
@@ -136,15 +140,19 @@ fn fs_main(in: VertexOutput) -> [[location(0)]] vec4<f32> {
     //let normal_color = (in.obj_normal + 1.0) * 0.5;
     //return vec4<f32>(normal_color, 1.0);
 
+    let camera_distance = distance(in.world_position, camera.view_pos.xyz);
+
     var barys = vec3<f32>(in.bary_coords, 0.0);
     barys.z = 1.0 - barys.x - barys.y;
     let deltas = fwidth(barys);
-    let smoothing = 0.0;//deltas * 0.1;
-    let thickness = deltas * 1.001;
+    let smoothing = deltas * wire.smoothing;
+    let thickness = deltas * wire.thickness / camera_distance;
     barys = smoothStep(thickness, thickness + smoothing, barys);
     var minBary = min(barys.x, min(barys.y, barys.z));
 
-    minBary = 1.0 - minBary;
+    if (i32(wire.invert_edges) == 0) {
+        minBary = 1.0 - minBary;
+    }
 
     if (minBary < 0.5) {
         discard;
