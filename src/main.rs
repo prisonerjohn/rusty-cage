@@ -889,6 +889,9 @@ fn main() {
         .build(&event_loop)
         .unwrap();
 
+    let mut is_focused = true;
+    let mut is_cursor_in_window = true;
+
     // Wait for State::new to finish...
     let mut state = pollster::block_on(State::new(&window));
     let mut last_render_time = std::time::Instant::now();
@@ -910,21 +913,23 @@ fn main() {
                 ref event,
                 ..
             } => {
-                match event {
-                    DeviceEvent::Key(..) => {
-                        if !gui.using_keyboard {
+                if is_focused && is_cursor_in_window {
+                    match event {
+                        DeviceEvent::Key(..) => {
+                            if !gui.using_keyboard {
+                                state.input(event);
+                            }
+                        }
+                        DeviceEvent::Button{..} 
+                        | DeviceEvent::MouseMotion{..}
+                        | DeviceEvent::MouseWheel{..} => {
+                            if !gui.using_pointer {
+                                state.input(event);
+                            }
+                        }
+                        _ => {
                             state.input(event);
                         }
-                    }
-                    DeviceEvent::Button{..} 
-                    | DeviceEvent::MouseMotion{..}
-                    | DeviceEvent::MouseWheel{..} => {
-                        if !gui.using_pointer {
-                            state.input(event);
-                        }
-                    }
-                    _ => {
-                        state.input(event);
                     }
                 }
             }
@@ -932,25 +937,43 @@ fn main() {
                 ref event,
                 window_id,
             } if window_id == window.id() => {
-                if !gui.window_event(&event) {
-                    match event {
-                        WindowEvent::CloseRequested 
-                        | WindowEvent::KeyboardInput {
-                            input: KeyboardInput {
-                                state: ElementState::Pressed,
-                                virtual_keycode: Some(VirtualKeyCode::Escape),
-                                ..
-                            },
-                            ..
-                        } => *control_flow = ControlFlow::Exit,
-                        WindowEvent::Resized(physical_size) => {
-                            state.resize(*physical_size);
+                match event {
+                    WindowEvent::Focused(val) => {
+                        is_focused = *val;
+                        println!("focus set {}", is_focused);
+                    }
+                    WindowEvent::CursorEntered { .. } => {
+                        is_cursor_in_window = true;
+                        println!("cursor in {}", is_cursor_in_window);
+                    }
+                    WindowEvent::CursorLeft { .. } => {
+                        is_cursor_in_window = false;
+                        println!("cursor in {}", is_cursor_in_window);
+                    }
+                    _ => {
+                        if is_focused {
+                            if !gui.window_event(&event) {
+                                match event {
+                                    WindowEvent::CloseRequested 
+                                    | WindowEvent::KeyboardInput {
+                                        input: KeyboardInput {
+                                            state: ElementState::Pressed,
+                                            virtual_keycode: Some(VirtualKeyCode::Escape),
+                                            ..
+                                        },
+                                        ..
+                                    } => *control_flow = ControlFlow::Exit,
+                                    WindowEvent::Resized(physical_size) => {
+                                        state.resize(*physical_size);
+                                    }
+                                    WindowEvent::ScaleFactorChanged { new_inner_size,.. } => {
+                                        // new_inner_size is &&mut so we have to dereference 2x
+                                        state.resize(**new_inner_size);
+                                    }
+                                    _ => {}
+                                }
+                            }
                         }
-                        WindowEvent::ScaleFactorChanged { new_inner_size,.. } => {
-                            // new_inner_size is &&mut so we have to dereference 2x
-                            state.resize(**new_inner_size);
-                        }
-                        _ => {}
                     }
                 }
             }
